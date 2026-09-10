@@ -1,0 +1,6 @@
+# Replace with your actual domain (Caddy auto-provisions Let's Encrypt TLS for it).
+# For a quick IP-only test without a domain/TLS, use ":80" instead and Caddy
+# will just serve plain HTTP.
+your-domain.com {
+    reverse_proxy frontend:80
+}
