@@ -6,16 +6,39 @@ function useSession() {
   const [sessionId, setSessionId] = useState(null)
 
   useEffect(() => {
-    fetch(`${API_BASE}/session`, { method: 'POST' })
-      .then((r) => r.json())
-      .then((d) => setSessionId(d.session_id))
-      .catch((err) => console.error('Session error:', err))
+    let cancelled = false
+
+    async function createSession() {
+      try {
+        const response = await fetch(`${API_BASE}/session`, {
+          method: 'POST',
+        })
+
+        if (!response.ok) {
+          throw new Error(`Session request failed: ${response.status}`)
+        }
+
+        const data = await response.json()
+
+        if (!cancelled) {
+          setSessionId(data.session_id)
+        }
+      } catch (error) {
+        console.error('Session error:', error)
+      }
+    }
+
+    createSession()
+
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   return sessionId
 }
 
-function App() {
+export default function App() {
   const sessionId = useSession()
 
   const [documents, setDocuments] = useState([])
@@ -26,13 +49,14 @@ function App() {
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [backend, setBackend] = useState('ollama')
-  const [sidebarOpen, setSidebarOpen] = useState(false)
 
   const chatEndRef = useRef(null)
   const fileInputRef = useRef(null)
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    chatEndRef.current?.scrollIntoView({
+      behavior: 'smooth',
+    })
   }, [messages])
 
   async function refreshDocuments() {
@@ -40,19 +64,27 @@ function App() {
 
     try {
       const response = await fetch(`${API_BASE}/documents/${sessionId}`)
+
+      if (!response.ok) {
+        throw new Error(`Failed to load documents: ${response.status}`)
+      }
+
       const data = await response.json()
-      setDocuments(data.documents || [])
+
+      setDocuments(Array.isArray(data.documents) ? data.documents : [])
     } catch (error) {
-      console.error('Document refresh error:', error)
+      console.error('Document loading error:', error)
     }
   }
 
   useEffect(() => {
-    if (sessionId) refreshDocuments()
+    if (sessionId) {
+      refreshDocuments()
+    }
   }, [sessionId])
 
   async function handleFiles(fileList) {
-    if (!sessionId || !fileList.length) return
+    if (!sessionId || !fileList?.length) return
 
     setUploading(true)
     setUploadResults([])
@@ -70,26 +102,34 @@ function App() {
       })
 
       if (!response.ok) {
-        const error = await response.json()
+        const errorData = await response
+          .json()
+          .catch(() => ({ detail: 'Upload failed' }))
+
         setUploadResults([
           {
             filename: '(batch)',
             status: 'error',
-            error: error.detail || 'Upload failed',
+            error: errorData.detail || 'Upload failed',
           },
         ])
-      } else {
-        const results = await response.json()
-        setUploadResults(results)
+
+        return
       }
+
+      const results = await response.json()
+
+      setUploadResults(Array.isArray(results) ? results : [])
 
       await refreshDocuments()
     } catch (error) {
+      console.error('Upload error:', error)
+
       setUploadResults([
         {
           filename: '(batch)',
           status: 'error',
-          error: error.message,
+          error: error.message || 'Upload failed',
         },
       ])
     } finally {
@@ -115,26 +155,12 @@ function App() {
     })
   }
 
-  function appendToLastAssistant(text) {
-    setMessages((previous) => {
-      const copy = [...previous]
-      const last = copy[copy.length - 1]
-
-      if (!last) return previous
-
-      copy[copy.length - 1] = {
-        ...last,
-        content: last.content + text,
-      }
-
-      return copy
-    })
-  }
-
   async function sendMessage() {
     const question = input.trim()
 
-    if (!question || streaming || !documents.length) return
+    if (!question || streaming || !documents.length || !sessionId) {
+      return
+    }
 
     setInput('')
 
@@ -145,8 +171,15 @@ function App() {
 
     setMessages((previous) => [
       ...previous,
-      { role: 'user', content: question },
-      { role: 'assistant', content: '', citations: [] },
+      {
+        role: 'user',
+        content: question,
+      },
+      {
+        role: 'assistant',
+        content: '',
+        citations: [],
+      },
     ])
 
     setStreaming(true)
@@ -170,12 +203,12 @@ function App() {
       })
 
       if (!response.ok || !response.body) {
-        const error = await response
+        const errorData = await response
           .json()
           .catch(() => ({ detail: 'Request failed' }))
 
         appendToLastAssistant(
-          `\n\n[Error: ${error.detail || 'Request failed'}]`
+          `\n\n[Error: ${errorData.detail || 'Request failed'}]`,
         )
 
         return
@@ -183,6 +216,7 @@ function App() {
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
+
       let buffer = ''
 
       while (true) {
@@ -190,424 +224,249 @@ function App() {
 
         if (done) break
 
-        buffer += decoder.decode(value, { stream: true })
+        buffer += decoder.decode(value, {
+          stream: true,
+        })
 
         const events = buffer.split('\n\n')
-        buffer = events.pop()
+
+        buffer = events.pop() || ''
 
         for (const rawEvent of events) {
           const lines = rawEvent.split('\n')
+
           const eventLine = lines.find((line) =>
-            line.startsWith('event: ')
-          )
-          const dataLine = lines.find((line) =>
-            line.startsWith('data: ')
+            line.startsWith('event: '),
           )
 
-          if (!eventLine || !dataLine) continue
+          const dataLine = lines.find((line) =>
+            line.startsWith('data: '),
+          )
+
+          if (!eventLine || !dataLine) {
+            continue
+          }
 
           const eventType = eventLine.replace('event: ', '')
-          const data = JSON.parse(
-            dataLine.replace('data: ', '')
-          )
+          const rawData = dataLine.replace('data: ', '')
+
+          let data
+
+          try {
+            data = JSON.parse(rawData)
+          } catch (error) {
+            console.error('Invalid stream data:', rawData)
+            continue
+          }
 
           if (eventType === 'citations') {
             setMessages((previous) => {
-              const copy = [...previous]
+              if (!previous.length) return previous
 
-              copy[copy.length - 1] = {
-                ...copy[copy.length - 1],
-                citations: data,
+              const copy = [...previous]
+              const lastIndex = copy.length - 1
+
+              copy[lastIndex] = {
+                ...copy[lastIndex],
+                citations: Array.isArray(data) ? data : [],
               }
 
               return copy
             })
-          }
-
-          if (eventType === 'token') {
-            appendToLastAssistant(data.text)
-          }
-
-          if (eventType === 'error') {
+          } else if (eventType === 'token') {
+            appendToLastAssistant(data.text || '')
+          } else if (eventType === 'error') {
             appendToLastAssistant(
-              `\n\n[Error: ${data.message}]`
+              `\n\n[Error: ${data.message || 'Unknown error'}]`,
             )
           }
         }
       }
     } catch (error) {
       appendToLastAssistant(
-        `\n\n[Connection error: ${error.message}]`
+        `\n\n[Connection error: ${error.message || 'Unknown error'}]`,
       )
     } finally {
       setStreaming(false)
     }
   }
 
-  function clearChat() {
-    setMessages([])
+  function appendToLastAssistant(text) {
+    if (!text) return
+
+    setMessages((previous) => {
+      if (!previous.length) return previous
+
+      const copy = [...previous]
+      const lastIndex = copy.length - 1
+      const lastMessage = copy[lastIndex]
+
+      copy[lastIndex] = {
+        ...lastMessage,
+        content: `${lastMessage.content || ''}${text}`,
+      }
+
+      return copy
+    })
   }
 
   return (
-    <div className="app-shell">
-      <div className="background-grid" />
+    <div className="app">
+      <aside className="sidebar">
+        <h1>📄 Multi-PDF RAG</h1>
 
-      <header className="topbar">
-        <div className="brand-area">
-          <button
-            className="mobile-menu-button"
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            aria-label="Toggle sidebar"
+        <section className="panel">
+          <label className="upload-btn">
+            {uploading
+              ? 'Processing…'
+              : `Upload PDFs (${documents.length}/50)`}
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/pdf"
+              multiple
+              hidden
+              disabled={uploading}
+              onChange={(event) =>
+                handleFiles(
+                  Array.from(event.target.files || []),
+                )
+              }
+            />
+          </label>
+
+          {uploadResults.length > 0 && (
+            <ul className="upload-log">
+              {uploadResults.map((result, index) => (
+                <li
+                  key={`${result.filename || 'file'}-${index}`}
+                  className={result.status}
+                >
+                  {result.filename} — {result.status}
+
+                  {result.error
+                    ? `: ${result.error}`
+                    : result.status !== 'error'
+                      ? ` (${result.pages || 0}p, ${
+                          result.chunks || 0
+                        } chunks)`
+                      : ''}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section className="panel">
+          <div className="panel-title">
+            Documents ({documents.length})
+          </div>
+
+          <div className="doc-hint">
+            Select to scope questions; none selected = search all
+          </div>
+
+          <ul className="doc-list">
+            {documents.map((name) => (
+              <li key={name}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={selectedDocs.has(name)}
+                    onChange={() => toggleDoc(name)}
+                  />
+
+                  {name}
+                </label>
+              </li>
+            ))}
+          </ul>
+        </section>
+
+        <section className="panel">
+          <div className="panel-title">LLM Backend</div>
+
+          <select
+            value={backend}
+            onChange={(event) => setBackend(event.target.value)}
           >
-            ☰
-          </button>
+            <option value="ollama">Local (Ollama)</option>
+            <option value="anthropic">API (Anthropic)</option>
+            <option value="openai">API (OpenAI)</option>
+          </select>
+        </section>
+      </aside>
 
-          <div className="brand-icon">◈</div>
-
-          <div>
-            <div className="brand-name">NEXUS RAG</div>
-            <div className="brand-subtitle">
-              ROBOTIC KNOWLEDGE INTERFACE
+      <main className="chat">
+        <div className="messages">
+          {messages.length === 0 && (
+            <div className="empty-state">
+              Upload PDFs, then ask a question grounded in them.
             </div>
-          </div>
-        </div>
+          )}
 
-        <div className="system-status">
-          <span className="status-dot" />
-          <span>SYSTEM ONLINE</span>
-          <span className="status-divider">|</span>
-          <span className="session-label">
-            {sessionId ? 'SESSION ACTIVE' : 'CONNECTING...'}
-          </span>
-        </div>
-      </header>
-
-      <div className="workspace">
-        <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
-          <div className="sidebar-heading">
-            <span>CONTROL PANEL</span>
-            <span className="panel-code">SYS.01</span>
-          </div>
-
-          <section className="control-card">
-            <div className="card-heading">
-              <span className="card-icon">↥</span>
-              <div>
-                <h3>Knowledge Upload</h3>
-                <p>Import PDF documents</p>
-              </div>
-            </div>
-
-            <label className="upload-zone">
-              <span className="upload-symbol">
-                {uploading ? '◌' : '＋'}
-              </span>
-
-              <strong>
-                {uploading
-                  ? 'PROCESSING FILES'
-                  : 'UPLOAD DOCUMENTS'}
-              </strong>
-
-              <small>
-                {documents.length}/50 documents indexed
-              </small>
-
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="application/pdf"
-                multiple
-                hidden
-                disabled={uploading}
-                onChange={(event) =>
-                  handleFiles(Array.from(event.target.files))
-                }
-              />
-            </label>
-
-            {uploadResults.length > 0 && (
-              <div className="upload-results">
-                {uploadResults.map((result, index) => (
-                  <div
-                    key={index}
-                    className={`upload-result ${result.status}`}
-                  >
-                    <span>
-                      {result.status === 'error' ? '×' : '✓'}
-                    </span>
-
-                    <div>
-                      <strong>{result.filename}</strong>
-                      <small>
-                        {result.error ||
-                          `${result.pages || 0} pages · ${
-                            result.chunks || 0
-                          } chunks`}
-                      </small>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-
-          <section className="control-card document-card">
-            <div className="card-heading">
-              <span className="card-icon">▤</span>
-              <div>
-                <h3>Document Matrix</h3>
-                <p>
-                  {selectedDocs.size
-                    ? `${selectedDocs.size} selected`
-                    : 'Searching all documents'}
+          {messages.map((message, index) => (
+            <div
+              key={index}
+              className={`message ${message.role}`}
+            >
+              <div className="bubble">
+                <p style={{ whiteSpace: 'pre-wrap' }}>
+                  {message.content}
                 </p>
-              </div>
-            </div>
 
-            <div className="document-list">
-              {documents.length === 0 ? (
-                <div className="empty-documents">
-                  No documents indexed yet.
-                </div>
-              ) : (
-                documents.map((name) => (
-                  <label className="document-item" key={name}>
-                    <input
-                      type="checkbox"
-                      checked={selectedDocs.has(name)}
-                      onChange={() => toggleDoc(name)}
-                    />
-
-                    <span className="document-file-icon">
-                      PDF
-                    </span>
-
-                    <span className="document-name" title={name}>
-                      {name}
-                    </span>
-
-                    <span className="document-check">
-                      {selectedDocs.has(name) ? '✓' : ''}
-                    </span>
-                  </label>
-                ))
-              )}
-            </div>
-          </section>
-
-          <section className="control-card">
-            <div className="card-heading">
-              <span className="card-icon">◉</span>
-              <div>
-                <h3>Neural Engine</h3>
-                <p>Choose response backend</p>
-              </div>
-            </div>
-
-            <select
-              className="backend-select"
-              value={backend}
-              onChange={(event) => setBackend(event.target.value)}
-            >
-              <option value="ollama">Local Engine · Ollama</option>
-              <option value="anthropic">Cloud Engine · Anthropic</option>
-              <option value="openai">Cloud Engine · OpenAI</option>
-            </select>
-          </section>
-
-          <div className="sidebar-footer">
-            <div className="footer-status">
-              <span className="status-dot" />
-              VECTOR DATABASE READY
-            </div>
-
-            <div className="footer-status">
-              <span className="status-dot purple" />
-              RETRIEVAL SYSTEM READY
-            </div>
-          </div>
-        </aside>
-
-        <main className="chat-area">
-          <div className="chat-header">
-            <div>
-              <div className="chat-eyebrow">
-                / CORE INTERFACE / CHAT MODULE
-              </div>
-
-              <h1>Ask your knowledge base.</h1>
-
-              <p>
-                Query your indexed documents using retrieval-augmented
-                generation.
-              </p>
-            </div>
-
-            <button
-              className="clear-button"
-              onClick={clearChat}
-              disabled={!messages.length}
-            >
-              ↻ Clear
-            </button>
-          </div>
-
-          <div className="chat-content">
-            {messages.length === 0 ? (
-              <div className="welcome-panel">
-                <div className="robot-orbit">
-                  <div className="orbit-ring ring-one" />
-                  <div className="orbit-ring ring-two" />
-                  <div className="robot-core">◈</div>
-                </div>
-
-                <div className="welcome-copy">
-                  <span className="welcome-tag">
-                    AI KNOWLEDGE SYSTEM
-                  </span>
-
-                  <h2>Ready for your next query.</h2>
-
-                  <p>
-                    Upload one or more PDFs, then ask a question.
-                    The system will retrieve relevant information
-                    and generate a grounded response.
-                  </p>
-                </div>
-
-                <div className="quick-actions">
-                  <button
-                    onClick={() =>
-                      setInput('Summarize the uploaded documents')
-                    }
-                    disabled={!documents.length}
-                  >
-                    Summarize documents
-                  </button>
-
-                  <button
-                    onClick={() =>
-                      setInput('What are the key concepts in these documents?')
-                    }
-                    disabled={!documents.length}
-                  >
-                    Find key concepts
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="messages">
-                {messages.map((message, index) => (
-                  <div
-                    key={index}
-                    className={`message-row ${message.role}`}
-                  >
-                    <div className="message-avatar">
-                      {message.role === 'user' ? 'U' : '◈'}
-                    </div>
-
-                    <div className="message-body">
-                      <div className="message-meta">
-                        {message.role === 'user'
-                          ? 'YOU'
-                          : 'NEXUS AI'}
-
-                        <span>
-                          {message.role === 'user'
-                            ? 'USER INPUT'
-                            : 'GENERATED RESPONSE'}
+                {message.citations &&
+                  message.citations.length > 0 && (
+                    <div className="citations">
+                      {message.citations.map((citation, citationIndex) => (
+                        <span
+                          key={citationIndex}
+                          className="citation-chip"
+                        >
+                          {citation.filename} · p.
+                          {citation.page_number}
                         </span>
-                      </div>
-
-                      <div className="message-bubble">
-                        <p>{message.content}</p>
-
-                        {message.citations &&
-                          message.citations.length > 0 && (
-                            <div className="citations">
-                              <div className="citation-title">
-                                SOURCE REFERENCES
-                              </div>
-
-                              {message.citations.map(
-                                (citation, citationIndex) => (
-                                  <span
-                                    key={citationIndex}
-                                    className="citation-chip"
-                                  >
-                                    {citation.filename} · p.
-                                    {citation.page_number}
-                                  </span>
-                                )
-                              )}
-                            </div>
-                          )}
-                      </div>
+                      ))}
                     </div>
-                  </div>
-                ))}
-
-                {streaming && (
-                  <div className="typing-indicator">
-                    <span />
-                    <span />
-                    <span />
-                    Generating response...
-                  </div>
-                )}
-
-                <div ref={chatEndRef} />
+                  )}
               </div>
-            )}
-          </div>
-
-          <div className="composer-wrapper">
-            <div className="composer-label">
-              <span className="status-dot" />
-              {documents.length
-                ? `${documents.length} DOCUMENTS AVAILABLE`
-                : 'UPLOAD A DOCUMENT TO BEGIN'}
             </div>
+          ))}
 
-            <div className="composer">
-              <input
-                type="text"
-                placeholder={
-                  documents.length
-                    ? 'Enter your query...'
-                    : 'Upload a PDF before asking a question'
-                }
-                value={input}
-                disabled={!documents.length || streaming}
-                onChange={(event) => setInput(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') sendMessage()
-                }}
-              />
+          <div ref={chatEndRef} />
+        </div>
 
-              <button
-                className="send-button"
-                onClick={sendMessage}
-                disabled={
-                  !documents.length ||
-                  streaming ||
-                  !input.trim()
-                }
-              >
-                {streaming ? '◌' : '➤'}
-              </button>
-            </div>
+        <div className="input-row">
+          <input
+            type="text"
+            placeholder={
+              documents.length
+                ? 'Ask about your documents…'
+                : 'Upload a PDF first…'
+            }
+            value={input}
+            disabled={!documents.length || streaming}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                sendMessage()
+              }
+            }}
+          />
 
-            <div className="composer-hint">
-              Press Enter to send · Responses are grounded in your
-              selected documents
-            </div>
-          </div>
-        </main>
-      </div>
+          <button
+            onClick={sendMessage}
+            disabled={
+              !documents.length ||
+              streaming ||
+              !input.trim()
+            }
+          >
+            {streaming ? '…' : 'Send'}
+          </button>
+        </div>
+      </main>
     </div>
   )
 }
-
-export default App
